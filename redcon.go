@@ -3,6 +3,7 @@ package redcon
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -25,7 +26,14 @@ var (
 	errDetached               = errors.New("detached")
 	errIncompleteCommand      = errors.New("incomplete command")
 	errTooMuchData            = errors.New("too much data")
+	errNotServing             = errors.New("not serving")
+	errAlreadyServing         = errors.New("already serving")
+	errNilListener            = errors.New("nil listener")
 )
+
+// ErrServerClosed is returned by Serve and by repeated calls to Close once the
+// server has reached its terminal state.
+var ErrServerClosed = errors.New("redcon: server closed")
 
 const maxBufferCap = 262144
 
@@ -187,15 +195,101 @@ func NewServerNetworkTLS(
 }
 
 // Close stops listening on the TCP address.
-// Already Accepted connections will be closed.
+// Already Accepted connections will be closed immediately.
+//
+// Close is the force-close phase of the server lifecycle. Use Shutdown to let
+// in-flight commands finish and deliver their responses before closing.
+//
+// Calling Close more than once is safe. Calls made after the server has
+// reached its terminal state return ErrServerClosed.
 func (s *Server) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ln == nil {
-		return errors.New("not serving")
+	switch s.state {
+	case stateIdle:
+		// The server was never served. Leave it startable.
+		s.mu.Unlock()
+		return errNotServing
+	case stateClosed:
+		s.mu.Unlock()
+		return ErrServerClosed
 	}
-	s.done = true
-	return s.ln.Close()
+	s.state = stateClosed
+	s.closeListenerLocked()
+	s.forceCloseConnsLocked()
+	s.maybeFinishLocked()
+	s.mu.Unlock()
+	// Close intentionally does not wait for handlers. It may be called from a
+	// handler or an accept callback, where waiting would deadlock.
+	return nil
+}
+
+// Shutdown gracefully shuts down the server.
+//
+// It stops accepting new connections, releases idle connections, and lets
+// connections that are handling a command finish that command and flush its
+// response before they are closed. Shutdown blocks until every connection has
+// drained or ctx is done.
+//
+// If ctx is done first, Shutdown returns ctx.Err() and leaves the server in the
+// draining state. Call Close to force the remaining connections closed.
+//
+// Shutdown is idempotent. Calls on a draining server wait for the same
+// completion, and calls on a server that was never started are a no-op. A nil
+// context is treated as context.Background().
+func (s *Server) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	switch s.state {
+	case stateIdle:
+		// Nothing is running. Leave the server startable.
+		s.mu.Unlock()
+		return nil
+	case stateServing:
+		s.state = stateDraining
+		s.closeListenerLocked()
+		conns := make([]*conn, 0, len(s.conns))
+		for c := range s.conns {
+			conns = append(conns, c)
+		}
+		s.maybeFinishLocked()
+		done := s.done
+		s.mu.Unlock()
+		// Never hold the server lock while waiting for handlers. Connection
+		// bookkeeping and command completion need that lock.
+		for _, c := range conns {
+			c.drain()
+		}
+		return waitDone(ctx, done)
+	default:
+		// Draining or closed. Wait for the same terminal state.
+		done := s.done
+		s.mu.Unlock()
+		return waitDone(ctx, done)
+	}
+}
+
+// Done returns a channel that is closed once the server has reached its
+// terminal state: the listener is closed and every connection handler has
+// returned. A server that was never started returns an open channel.
+func (s *Server) Done() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initDoneLocked()
+	return s.done
+}
+
+func waitDone(ctx context.Context, done <-chan struct{}) error {
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // ListenAndServe serves incoming connections.
@@ -205,19 +299,18 @@ func (s *Server) ListenAndServe() error {
 
 // Addr returns server's listen address
 func (s *Server) Addr() net.Addr {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ln == nil {
+		return nil
+	}
 	return s.ln.Addr()
 }
 
 // Close stops listening on the TCP address.
-// Already Accepted connections will be closed.
+// Already Accepted connections will be closed immediately.
 func (s *TLSServer) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ln == nil {
-		return errors.New("not serving")
-	}
-	s.done = true
-	return s.ln.Close()
+	return s.Server.Close()
 }
 
 // ListenAndServe serves incoming connections.
@@ -238,16 +331,18 @@ func Serve(ln net.Listener,
 	accept func(conn Conn) bool,
 	closed func(conn Conn, err error),
 ) error {
+	if ln == nil {
+		return errNilListener
+	}
 	s := newServer()
 	s.mu.Lock()
 	s.net = ln.Addr().Network()
 	s.laddr = ln.Addr().String()
-	s.ln = ln
 	s.handler = handler
 	s.accept = accept
 	s.closed = closed
 	s.mu.Unlock()
-	return serve(s)
+	return s.serve(ln)
 }
 
 // ListenAndServe creates a new server and binds to addr configured on "tcp" network net.
@@ -295,130 +390,222 @@ func ListenAndServeNetworkTLS(
 // ListenServeAndSignal serves incoming connections and passes nil or error
 // when listening. signal can be nil.
 func (s *Server) ListenServeAndSignal(signal chan error) error {
-	ln, err := net.Listen(s.net, s.laddr)
-	if err != nil {
-		if signal != nil {
-			signal <- err
-		}
-		return err
-	}
-	s.mu.Lock()
-	s.ln = ln
-	s.mu.Unlock()
-	if signal != nil {
-		signal <- nil
-	}
-	return serve(s)
-}
-
-// Serve serves incoming connections with the given net.Listener.
-func (s *Server) Serve(ln net.Listener) error {
-	s.mu.Lock()
-	s.ln = ln
-	s.net = ln.Addr().Network()
-	s.laddr = ln.Addr().String()
-	s.mu.Unlock()
-	return serve(s)
+	return s.listenServeAndSignal(signal, func() (net.Listener, error) {
+		s.mu.Lock()
+		network, laddr := s.net, s.laddr
+		s.mu.Unlock()
+		return net.Listen(network, laddr)
+	})
 }
 
 // ListenServeAndSignal serves incoming connections and passes nil or error
 // when listening. signal can be nil.
 func (s *TLSServer) ListenServeAndSignal(signal chan error) error {
-	ln, err := tls.Listen(s.net, s.laddr, s.config)
+	return s.listenServeAndSignal(signal, func() (net.Listener, error) {
+		s.mu.Lock()
+		network, laddr, config := s.net, s.laddr, s.config
+		s.mu.Unlock()
+		return tls.Listen(network, laddr, config)
+	})
+}
+
+func (s *Server) listenServeAndSignal(
+	signal chan error,
+	listen func() (net.Listener, error),
+) error {
+	s.mu.Lock()
+	s.initLocked()
+	switch s.state {
+	case stateServing, stateDraining:
+		s.mu.Unlock()
+		if signal != nil {
+			signal <- errAlreadyServing
+		}
+		return errAlreadyServing
+	case stateClosed:
+		s.mu.Unlock()
+		if signal != nil {
+			signal <- ErrServerClosed
+		}
+		return ErrServerClosed
+	}
+	s.mu.Unlock()
+
+	ln, err := listen()
 	if err != nil {
 		if signal != nil {
 			signal <- err
 		}
 		return err
 	}
-	s.mu.Lock()
-	s.ln = ln
-	s.mu.Unlock()
-	if signal != nil {
-		signal <- nil
+	err = s.serveListener(ln, func() {
+		if signal != nil {
+			signal <- nil
+		}
+	})
+	if err == ErrServerClosed || err == errAlreadyServing {
+		ln.Close()
 	}
-	return serve(s.Server)
+	return err
 }
 
-func serve(s *Server) error {
-	defer func() {
-		s.ln.Close()
-		func() {
-			s.mu.Lock()
-			defer s.mu.Unlock()
-			for c := range s.conns {
-				c.conn.Close()
-			}
-			s.conns = nil
-		}()
-	}()
-	for {
-		lnconn, err := s.ln.Accept()
-		if err != nil {
-			s.mu.Lock()
-			done := s.done
-			s.mu.Unlock()
-			if done {
-				return nil
-			}
-			if errors.Is(err, net.ErrClosed) {
-				// see https://github.com/tidwall/redcon/issues/46
-				return nil
-			}
-			if s.AcceptError != nil {
-				s.AcceptError(err)
-			}
-			continue
-		}
-		c := &conn{
-			conn: lnconn,
-			addr: lnconn.RemoteAddr().String(),
-			wr:   NewWriter(lnconn),
-			rd:   NewReader(lnconn),
-		}
-		s.mu.Lock()
-		c.idleClose = s.idleClose
-		s.conns[c] = true
-		s.mu.Unlock()
-		if s.accept != nil && !s.accept(c) {
-			s.mu.Lock()
-			delete(s.conns, c)
-			s.mu.Unlock()
-			c.Close()
-			continue
-		}
-		go handle(s, c)
+// Serve serves incoming connections with the given net.Listener.
+//
+// The server takes ownership of ln for the duration of the call. Serve blocks
+// until the server reaches its terminal state and every connection handler has
+// returned.
+func (s *Server) Serve(ln net.Listener) error {
+	if ln == nil {
+		return errNilListener
 	}
+	return s.serve(ln)
+}
+
+func (s *Server) serve(ln net.Listener) error {
+	return s.serveListener(ln, nil)
+}
+
+func (s *Server) serveListener(ln net.Listener, onListening func()) error {
+	if ln == nil {
+		return errNilListener
+	}
+	s.mu.Lock()
+	s.initLocked()
+	switch s.state {
+	case stateServing, stateDraining:
+		s.mu.Unlock()
+		return errAlreadyServing
+	case stateClosed:
+		s.mu.Unlock()
+		return ErrServerClosed
+	}
+	s.state = stateServing
+	s.ln = ln
+	s.lnClosed = false
+	if s.net == "" {
+		s.net = ln.Addr().Network()
+	}
+	s.laddr = ln.Addr().String()
+	s.mu.Unlock()
+	if onListening != nil {
+		onListening()
+	}
+
+	for {
+		lnconn, err := ln.Accept()
+		if err != nil {
+			if s.acceptFailed(err) {
+				break
+			}
+			continue
+		}
+		s.initConn(lnconn)
+	}
+
+	s.mu.Lock()
+	switch s.state {
+	case stateServing:
+		// The listener was closed externally. Stop accepting and force close
+		// any connections so the terminal state is still reached.
+		s.state = stateClosed
+	case stateDraining:
+	}
+	s.closeListenerLocked()
+	if s.state == stateClosed {
+		s.forceCloseConnsLocked()
+	}
+	s.maybeFinishLocked()
+	done := s.done
+	s.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+	s.connWG.Wait()
+	return nil
+}
+
+func (s *Server) acceptFailed(err error) bool {
+	s.mu.Lock()
+	if s.state != stateServing || s.lnClosed {
+		s.mu.Unlock()
+		return true
+	}
+	if errors.Is(err, net.ErrClosed) {
+		// See https://github.com/tidwall/redcon/issues/46.
+		s.mu.Unlock()
+		return true
+	}
+	cb := s.AcceptError
+	s.mu.Unlock()
+	if cb != nil {
+		cb(err)
+	}
+	return false
+}
+
+func (s *Server) initConn(lnconn net.Conn) {
+	c := &conn{
+		conn: lnconn,
+		addr: lnconn.RemoteAddr().String(),
+		wr:   NewWriter(lnconn),
+		rd:   NewReader(lnconn),
+	}
+	s.mu.Lock()
+	s.initLocked()
+	if s.state != stateServing {
+		s.mu.Unlock()
+		c.closeNet()
+		return
+	}
+	c.idleClose = s.idleClose
+	accept := s.accept
+	s.mu.Unlock()
+	if accept != nil && !accept(c) {
+		c.closeNet()
+		return
+	}
+	s.mu.Lock()
+	if s.state != stateServing {
+		s.mu.Unlock()
+		c.closeNet()
+		return
+	}
+	s.conns[c] = true
+	s.connWG.Add(1)
+	s.mu.Unlock()
+	go handle(s, c)
 }
 
 // handle manages the server connection.
 func handle(s *Server, c *conn) {
 	var err error
 	defer func() {
-		if err != errDetached {
-			// do not close the connection when a detach is detected.
-			c.conn.Close()
+		defer s.connWG.Done()
+		if !c.isDetached() {
+			// The handler goroutine is the sole owner of closing the socket.
+			c.closeNet()
 		}
-		func() {
-			// remove the conn from the server
-			s.mu.Lock()
-			defer s.mu.Unlock()
-			delete(s.conns, c)
-			if s.closed != nil {
-				if err == io.EOF {
-					err = nil
-				}
-				s.closed(c, err)
+		// Deregister before invoking the callback so a callback that calls
+		// Close or Shutdown cannot deadlock on its own connection.
+		s.mu.Lock()
+		delete(s.conns, c)
+		cb := s.closed
+		s.maybeFinishLocked()
+		s.mu.Unlock()
+		if cb != nil {
+			if err == io.EOF {
+				err = nil
 			}
-		}()
+			cb(c, err)
+		}
 	}()
 
 	err = func() error {
 		// read commands and feed back to the client
 		for {
 			// read pipeline commands
-			if c.idleClose != 0 {
-				c.conn.SetReadDeadline(time.Now().Add(c.idleClose))
+			if !c.prepareRead() {
+				return ErrServerClosed
 			}
 			cmds, err := c.rd.readCommands(nil)
 			if err != nil {
@@ -427,6 +614,10 @@ func handle(s *Server, c *conn) {
 					// the client. Ignore write errors.
 					c.wr.WriteError("ERR " + err.Error())
 					c.wr.Flush()
+					return err
+				}
+				if c.isStopping() {
+					return ErrServerClosed
 				}
 				return err
 			}
@@ -440,11 +631,11 @@ func handle(s *Server, c *conn) {
 				}
 				s.handler(c, cmd)
 			}
-			if c.detached {
+			if c.isDetached() {
 				// client has been detached
 				return errDetached
 			}
-			if c.closed {
+			if c.isClosed() {
 				return nil
 			}
 			if err := c.wr.Flush(); err != nil {
@@ -461,16 +652,88 @@ type conn struct {
 	rd        *Reader
 	addr      string
 	ctx       interface{}
-	detached  bool
-	closed    bool
 	cmds      []Command
 	idleClose time.Duration
+
+	// mu guards the lifecycle flags below.
+	mu           sync.Mutex
+	detached     bool
+	closed       bool
+	stopping     bool
+	closeNetOnce sync.Once
 }
 
 func (c *conn) Close() error {
-	c.wr.Flush()
+	c.mu.Lock()
 	c.closed = true
-	return c.conn.Close()
+	c.mu.Unlock()
+	c.wr.Flush()
+	c.closeNet()
+	return nil
+}
+
+func (c *conn) closeNet() {
+	c.closeNetOnce.Do(func() {
+		c.conn.Close()
+	})
+}
+
+func (c *conn) isDetached() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.detached
+}
+
+func (c *conn) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
+}
+
+func (c *conn) isStopping() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stopping
+}
+
+func (c *conn) prepareRead() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopping || c.closed {
+		return false
+	}
+	if c.idleClose != 0 {
+		c.conn.SetReadDeadline(time.Now().Add(c.idleClose))
+	}
+	return true
+}
+
+// drain marks the connection as stopping and wakes a pending read. A command
+// that is currently executing is allowed to finish and flush its response.
+func (c *conn) drain() {
+	c.mu.Lock()
+	if c.closed || c.detached || c.stopping {
+		c.mu.Unlock()
+		return
+	}
+	c.stopping = true
+	// Interrupt a blocked read without closing the write side, so an in-flight
+	// command can still deliver its result.
+	c.conn.SetReadDeadline(time.Now())
+	c.mu.Unlock()
+}
+
+// forceClose closes the socket without touching the writer, which avoids
+// racing with an in-flight response.
+func (c *conn) forceClose() {
+	c.mu.Lock()
+	if c.detached {
+		c.mu.Unlock()
+		return
+	}
+	c.stopping = true
+	c.mu.Unlock()
+	c.closeNet()
 }
 func (c *conn) Context() interface{}        { return c.ctx }
 func (c *conn) SetContext(v interface{})    { c.ctx = v }
@@ -526,7 +789,9 @@ type DetachedConn interface {
 // All writes such as WriteString() will not be written to the client
 // until Flush() is called.
 func (c *conn) Detach() DetachedConn {
+	c.mu.Lock()
 	c.detached = true
+	c.mu.Unlock()
 	cmds := c.cmds
 	c.cmds = nil
 	return &detachedConn{conn: c, cmds: cmds}
@@ -568,6 +833,20 @@ type Command struct {
 	Args [][]byte
 }
 
+type serverState int
+
+const (
+	// stateIdle means the server has not started serving yet.
+	stateIdle serverState = iota
+	// stateServing means the listener is accepting new connections.
+	stateServing
+	// stateDraining means the listener is closed and accepted connections are
+	// finishing their current command.
+	stateDraining
+	// stateClosed is the terminal state.
+	stateClosed
+)
+
 // Server defines a server for clients for managing client connections.
 type Server struct {
 	mu        sync.Mutex
@@ -578,11 +857,63 @@ type Server struct {
 	closed    func(conn Conn, err error)
 	conns     map[*conn]bool
 	ln        net.Listener
-	done      bool
+	state     serverState
+	lnClosed  bool
+	done      chan struct{}
+	doneShut  bool
 	idleClose time.Duration
+	connWG    sync.WaitGroup
 
 	// AcceptError is an optional function used to handle Accept errors.
 	AcceptError func(err error)
+}
+
+func (s *Server) initLocked() {
+	if s.conns == nil {
+		s.conns = make(map[*conn]bool)
+	}
+	if s.done == nil {
+		s.done = make(chan struct{})
+	}
+}
+
+func (s *Server) initDoneLocked() {
+	if s.done == nil {
+		s.done = make(chan struct{})
+	}
+}
+
+func (s *Server) closeDoneLocked() {
+	s.initDoneLocked()
+	if !s.doneShut {
+		s.doneShut = true
+		close(s.done)
+	}
+}
+
+func (s *Server) closeListenerLocked() bool {
+	if s.ln == nil || s.lnClosed {
+		return false
+	}
+	s.lnClosed = true
+	s.ln.Close()
+	return true
+}
+
+func (s *Server) forceCloseConnsLocked() {
+	for c := range s.conns {
+		c.forceClose()
+	}
+}
+
+func (s *Server) maybeFinishLocked() {
+	if (s.state == stateClosed || s.state == stateDraining) &&
+		len(s.conns) == 0 {
+		if s.state == stateDraining {
+			s.state = stateClosed
+		}
+		s.closeDoneLocked()
+	}
 }
 
 // TLSServer defines a server for clients for managing client connections.

@@ -164,6 +164,26 @@ func main() {
 }
 ```
 
+Graceful shutdown
+-----------------
+
+`Shutdown` stops accepting new connections and lets already accepted
+connections finish their current command before closing. The context bounds the
+drain; if it expires, call `Close` to force the remaining connections closed.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+if err := srv.Shutdown(ctx); err != nil {
+	log.Printf("drain did not finish: %v", err)
+	if err := srv.Close(); err != nil {
+		log.Printf("force close: %v", err)
+	}
+}
+```
+
+`Done` is closed when the listener and all connection handlers have finished.
+
 TLS Example
 -----------
 
