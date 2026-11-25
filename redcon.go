@@ -22,6 +22,7 @@ var (
 	errUnbalancedQuotes       = &errProtocol{"unbalanced quotes in request"}
 	errInvalidBulkLength      = &errProtocol{"invalid bulk length"}
 	errInvalidMultiBulkLength = &errProtocol{"invalid multibulk length"}
+	errCommandTooLarge        = &errProtocol{"command too large"}
 	errDetached               = errors.New("detached")
 	errIncompleteCommand      = errors.New("incomplete command")
 	errTooMuchData            = errors.New("too much data")
@@ -377,7 +378,17 @@ func serve(s *Server) error {
 			rd:   NewReader(lnconn),
 		}
 		s.mu.Lock()
+		if s.MaxConns > 0 && len(s.conns) >= s.MaxConns {
+			// Too many connections. Notify the client and close the
+			// connection right away, without registering it or
+			// spawning a goroutine.
+			s.mu.Unlock()
+			lnconn.Write([]byte("-ERR max number of clients reached\r\n"))
+			lnconn.Close()
+			continue
+		}
 		c.idleClose = s.idleClose
+		c.rd.maxCommandSize = s.MaxCommandSize
 		s.conns[c] = true
 		s.mu.Unlock()
 		if s.accept != nil && !s.accept(c) {
@@ -581,6 +592,17 @@ type Server struct {
 	done      bool
 	idleClose time.Duration
 
+	// MaxConns is the maximum number of concurrent client connections.
+	// Connections that arrive after the limit has been reached are
+	// sent an error and closed right away, without spawning a
+	// goroutine. A value of zero means no limit.
+	MaxConns int
+	// MaxCommandSize is the maximum size in bytes of a single client
+	// command. Connections that send a command larger than this
+	// receive a protocol error and are closed. A value of zero means
+	// no limit.
+	MaxCommandSize int
+
 	// AcceptError is an optional function used to handle Accept errors.
 	AcceptError func(err error)
 }
@@ -763,11 +785,12 @@ func (w *Writer) WriteAny(v interface{}) {
 
 // Reader represent a reader for RESP or telnet commands.
 type Reader struct {
-	rd    *bufio.Reader
-	buf   []byte
-	start int
-	end   int
-	cmds  []Command
+	rd             *bufio.Reader
+	buf            []byte
+	start          int
+	end            int
+	cmds           []Command
+	maxCommandSize int
 }
 
 // NewReader returns a command reader which will read RESP or telnet commands.
@@ -800,6 +823,9 @@ func (rd *Reader) readCommands(leftover *int) ([]Command, error) {
 			// just a plain text command
 			for i := 0; i < len(b); i++ {
 				if b[i] == '\n' {
+					if rd.maxCommandSize > 0 && i+1 > rd.maxCommandSize {
+						return nil, errCommandTooLarge
+					}
 					var line []byte
 					if i > 0 && b[i-1] == '\r' {
 						line = b[:i-1]
@@ -935,6 +961,9 @@ func (rd *Reader) readCommands(leftover *int) ([]Command, error) {
 						}
 					}
 					if len(marks) == count*2 {
+						if rd.maxCommandSize > 0 && i+1 > rd.maxCommandSize {
+							return nil, errCommandTooLarge
+						}
 						var cmd Command
 						if rd.rd != nil {
 							// make a raw copy of the entire command when
@@ -978,9 +1007,23 @@ func (rd *Reader) readCommands(leftover *int) ([]Command, error) {
 		if rd.start == rd.end {
 			// rewind the to the beginning
 			rd.start, rd.end = 0, 0
+		} else if rd.start > 0 {
+			// shift the unparsed data to the beginning of the buffer
+			// to make room for more.
+			copy(rd.buf, rd.buf[rd.start:rd.end])
+			rd.end -= rd.start
+			rd.start = 0
 		} else {
-			// must grow the buffer
-			newbuf := make([]byte, len(rd.buf)*2)
+			// the buffer is entirely filled by a single incomplete
+			// command. it must grow, but not past the limit.
+			if rd.maxCommandSize > 0 && len(rd.buf) >= rd.maxCommandSize {
+				return nil, errCommandTooLarge
+			}
+			newcap := len(rd.buf) * 2
+			if rd.maxCommandSize > 0 && newcap > rd.maxCommandSize {
+				newcap = rd.maxCommandSize
+			}
+			newbuf := make([]byte, newcap)
 			copy(newbuf, rd.buf)
 			rd.buf = newbuf
 		}

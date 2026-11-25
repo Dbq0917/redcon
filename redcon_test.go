@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -363,6 +364,190 @@ func testServerNetwork(t *testing.T, network, laddr string) {
 		}
 	}()
 	<-done
+}
+
+func startLimitServer(t *testing.T, maxConns, maxCommandSize int) (*Server, string) {
+	t.Helper()
+	s := NewServer("127.0.0.1:0",
+		func(conn Conn, cmd Command) {
+			conn.WriteString("PONG")
+		},
+		nil, nil,
+	)
+	s.MaxConns = maxConns
+	s.MaxCommandSize = maxCommandSize
+	signal := make(chan error)
+	go func() {
+		s.ListenServeAndSignal(signal)
+	}()
+	if err := <-signal; err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s, s.Addr().String()
+}
+
+func pingConn(t *testing.T, c net.Conn) string {
+	t.Helper()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(c, "PING\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(buf[:n])
+}
+
+func TestServerMaxConns(t *testing.T) {
+	_, addr := startLimitServer(t, 2, 0)
+
+	c1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	c2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	if res := pingConn(t, c1); res != "+PONG\r\n" {
+		t.Fatalf("expected '+PONG\\r\\n', got '%v'", res)
+	}
+	if res := pingConn(t, c2); res != "+PONG\r\n" {
+		t.Fatalf("expected '+PONG\\r\\n', got '%v'", res)
+	}
+
+	// the next connection must be clearly rejected
+	c3, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c3.Close()
+	c3.SetDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 128)
+	n, err := c3.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res := string(buf[:n]); res != "-ERR max number of clients reached\r\n" {
+		t.Fatalf("expected rejection error, got '%v'", res)
+	}
+	if _, err := c3.Read(buf); err != io.EOF {
+		t.Fatalf("expected connection to be closed, got '%v'", err)
+	}
+
+	// flood the server with connections; all must be rejected without
+	// leaving half-open goroutines behind.
+	base := runtime.NumGoroutine()
+	for i := 0; i < 1000; i++ {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.SetDeadline(time.Now().Add(5 * time.Second))
+		n, err := c.Read(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res := string(buf[:n]); res != "-ERR max number of clients reached\r\n" {
+			t.Fatalf("expected rejection error, got '%v'", res)
+		}
+		c.Close()
+	}
+	// the allowed connections are still served
+	if res := pingConn(t, c1); res != "+PONG\r\n" {
+		t.Fatalf("expected '+PONG\\r\\n', got '%v'", res)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > base+10 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if n := runtime.NumGoroutine(); n > base+10 {
+		t.Fatalf("rejected connections leaked goroutines: base %d, now %d", base, n)
+	}
+
+	// a freed slot must be reusable
+	c2.Close()
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		c4, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res := pingConn(t, c4)
+		c4.Close()
+		if res == "+PONG\r\n" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected slot to be reusable, got '%v'", res)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestServerMaxCommandSize(t *testing.T) {
+	_, addr := startLimitServer(t, 0, 1024)
+
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if res := pingConn(t, c); res != "+PONG\r\n" {
+		t.Fatalf("expected '+PONG\\r\\n', got '%v'", res)
+	}
+
+	// a single oversized RESP command must be rejected
+	big := append([]byte("*2\r\n$3\r\nGET\r\n$8192\r\n"), make([]byte, 8192)...)
+	big = append(big, '\r', '\n')
+	if _, err := c.Write(big); err != nil {
+		t.Fatal(err)
+	}
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 128)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res := string(buf[:n]); res != "-ERR Protocol error: command too large\r\n" {
+		t.Fatalf("expected command too large error, got '%v'", res)
+	}
+	if _, err := c.Read(buf); err == nil {
+		t.Fatalf("expected connection to be closed, got '%v'", err)
+	}
+
+	// a single oversized plain-text command must be rejected too
+	c2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	if _, err := c2.Write(append(make([]byte, 2048), '\r', '\n')); err != nil {
+		t.Fatal(err)
+	}
+	c2.SetDeadline(time.Now().Add(5 * time.Second))
+	n, err = c2.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res := string(buf[:n]); res != "-ERR Protocol error: command too large\r\n" {
+		t.Fatalf("expected command too large error, got '%v'", res)
+	}
+
+	// small commands on fresh connections still work
+	c3, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c3.Close()
+	if res := pingConn(t, c3); res != "+PONG\r\n" {
+		t.Fatalf("expected '+PONG\\r\\n', got '%v'", res)
+	}
 }
 
 func TestConnImpl(t *testing.T) {
