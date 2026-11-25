@@ -550,6 +550,14 @@ func TestParse(t *testing.T) {
 	if err != errIncompleteCommand {
 		t.Fatalf("expected '%v', got '%v'", errIncompleteCommand, err)
 	}
+	_, err = Parse([]byte("*2\r\n$4\r\nECHO\r\n$5\r\nhe"))
+	if err != errIncompleteCommand {
+		t.Fatalf("expected '%v', got '%v'", errIncompleteCommand, err)
+	}
+	_, err = Parse([]byte("\r\n"))
+	if err != errIncompleteCommand {
+		t.Fatalf("expected '%v', got '%v'", errIncompleteCommand, err)
+	}
 	_, err = Parse([]byte("*-1\r\n"))
 	if err != errInvalidMultiBulkLength {
 		t.Fatalf("expected '%v', got '%v'", errInvalidMultiBulkLength, err)
@@ -583,6 +591,66 @@ func TestParse(t *testing.T) {
 	}
 	if string(cmd.Args[0]) != "A" {
 		t.Fatalf("expected '%v', got '%v'", "A", string(cmd.Args[0]))
+	}
+}
+
+type emptyReader struct{}
+
+func (emptyReader) Read(p []byte) (int, error) { return 0, nil }
+
+func TestReaderNoProgress(t *testing.T) {
+	rd := NewReader(emptyReader{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := rd.ReadCommand()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != io.ErrNoProgress {
+			t.Fatalf("expected '%v', got '%v'", io.ErrNoProgress, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected ReadCommand to return")
+	}
+}
+
+func TestReaderHalfCommand(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+	rd := NewReader(pr)
+	type result struct {
+		cmd Command
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		cmd, err := rd.ReadCommand()
+		done <- result{cmd, err}
+	}()
+	if _, err := pw.Write([]byte("*2\r\n$4\r\nECHO\r\n$5\r\nhe")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case res := <-done:
+		t.Fatalf("expected ReadCommand to wait, got '%v'", res.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := pw.Write([]byte("llo\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		if len(res.cmd.Args) != 2 || string(res.cmd.Args[0]) != "ECHO" ||
+			string(res.cmd.Args[1]) != "hello" {
+			t.Fatalf("unexpected command args '%v'", res.cmd.Args)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected ReadCommand to return")
 	}
 }
 

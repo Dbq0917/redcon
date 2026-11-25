@@ -218,6 +218,69 @@ func TestNextCommand(t *testing.T) {
 	}
 }
 
+func TestNextCommandBoundary(t *testing.T) {
+	// empty packet: no command yet, and no error
+	complete, _, _, leftover, err := ReadNextCommand(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if complete || len(leftover) != 0 {
+		t.Fatalf("expected no command, got complete=%v leftover=%q",
+			complete, leftover)
+	}
+	// incomplete commands: no command yet, no error, unparsed packet
+	// remains as the leftover
+	for _, half := range []string{
+		"*1",
+		"*2\r\n$4\r\nECHO\r\n",
+		"*2\r\n$4\r\nECHO\r\n$5\r\nhe",
+		"$5 hello",
+		"PING",
+	} {
+		complete, _, _, leftover, err = ReadNextCommand([]byte(half), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if complete {
+			t.Fatalf("expected incomplete command for %q", half)
+		}
+		if string(leftover) != half {
+			t.Fatalf("expected leftover %q, got %q", half, leftover)
+		}
+	}
+	// blank lines are skipped, not returned as empty commands
+	complete, _, _, leftover, err = ReadNextCommand([]byte("\r\n"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if complete || len(leftover) != 0 {
+		t.Fatalf("expected no command, got complete=%v leftover=%q",
+			complete, leftover)
+	}
+	complete, args, _, leftover, err := ReadNextCommand([]byte("\r\nPING\r\n"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !complete || len(args) != 1 || string(args[0]) != "PING" ||
+		len(leftover) != 0 {
+		t.Fatalf("expected PING, got complete=%v args=%q leftover=%q",
+			complete, args, leftover)
+	}
+	// negative bulk lengths are protocol errors, not panics
+	for _, bad := range []string{
+		"*1\r\n$-1\r\n\r\n",
+		"*1\r\n$-2\r\nXX\r\n",
+	} {
+		complete, _, _, _, err = ReadNextCommand([]byte(bad), nil)
+		if err != errInvalidBulkLength {
+			t.Fatalf("expected '%v', got '%v'", errInvalidBulkLength, err)
+		}
+		if complete {
+			t.Fatalf("expected no command for %q", bad)
+		}
+	}
+}
+
 func TestAppendBulkFloat(t *testing.T) {
 	var b []byte
 	b = AppendString(b, "HELLO")

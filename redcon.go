@@ -785,6 +785,7 @@ func parseInt(b []byte) (int, bool) {
 
 func (rd *Reader) readCommands(leftover *int) ([]Command, error) {
 	var cmds []Command
+again:
 	b := rd.buf[rd.start:rd.end]
 	if rd.end-rd.start == 0 && len(rd.buf) > 4096 {
 		rd.buf = rd.buf[:4096]
@@ -985,12 +986,22 @@ func (rd *Reader) readCommands(leftover *int) ([]Command, error) {
 			rd.buf = newbuf
 		}
 	}
-	n, err := rd.rd.Read(rd.buf[rd.end:])
+	var n int
+	var err error
+	for i := 0; i < 100; i++ {
+		n, err = rd.rd.Read(rd.buf[rd.end:])
+		if n > 0 || err != nil {
+			break
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
+	if n == 0 {
+		return nil, io.ErrNoProgress
+	}
 	rd.end += n
-	return rd.readCommands(leftover)
+	goto again
 }
 
 // ReadCommands reads the next pipeline commands.
@@ -1034,6 +1045,9 @@ func Parse(raw []byte) (Command, error) {
 	}
 	if leftover > 0 {
 		return Command{}, errTooMuchData
+	}
+	if len(cmds) == 0 {
+		return Command{}, errIncompleteCommand
 	}
 	return cmds[0], nil
 

@@ -261,7 +261,7 @@ func ReadNextCommand(packet []byte, argsbuf [][]byte) (
 								return false, args[:0], Redis, packet, errInvalidBulkLength
 							}
 							n, ok := parseInt(packet[s : i-1])
-							if !ok || count <= 0 {
+							if !ok || n < 0 {
 								return false, args[:0], Redis, packet, errInvalidBulkLength
 							}
 							i++
@@ -348,6 +348,7 @@ func readTelnetCommand(packet []byte, argsbuf [][]byte) (
 	complete bool, args [][]byte, kind Kind, leftover []byte, err error,
 ) {
 	// just a plain text command
+again:
 	for i := 0; i < len(packet); i++ {
 		if packet[i] == '\n' {
 			var line []byte
@@ -415,6 +416,10 @@ func readTelnetCommand(packet []byte, argsbuf [][]byte) (
 					args = append(args, line)
 				}
 				break
+			}
+			if len(args) == 0 {
+				packet = packet[i+1:]
+				goto again
 			}
 			return true, args, Telnet, packet[i+1:], nil
 		}
