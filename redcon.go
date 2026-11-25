@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -124,8 +125,9 @@ func NewServer(addr string,
 	handler func(conn Conn, cmd Command),
 	accept func(conn Conn) bool,
 	closed func(conn Conn, err error),
+	extra ...any,
 ) *Server {
-	return NewServerNetwork("tcp", addr, handler, accept, closed)
+	return NewServerNetwork("tcp", addr, handler, accept, closed, extra...)
 }
 
 // NewServerTLS returns a new Redcon TLS server configured on "tcp" network net.
@@ -145,6 +147,7 @@ func NewServerNetwork(
 	handler func(conn Conn, cmd Command),
 	accept func(conn Conn) bool,
 	closed func(conn Conn, err error),
+	extra ...any,
 ) *Server {
 	if handler == nil {
 		panic("handler is nil")
@@ -155,6 +158,7 @@ func NewServerNetwork(
 	s.handler = handler
 	s.accept = accept
 	s.closed = closed
+	s.applyExtra(extra)
 	return s
 }
 
@@ -171,12 +175,13 @@ func NewServerNetworkTLS(
 		panic("handler is nil")
 	}
 	s := Server{
-		net:     net,
-		laddr:   laddr,
-		handler: handler,
-		accept:  accept,
-		closed:  closed,
-		conns:   make(map[*conn]bool),
+		net:         net,
+		laddr:       laddr,
+		handler:     handler,
+		accept:      accept,
+		closed:      closed,
+		conns:       make(map[*conn]bool),
+		timeoutWake: make(chan struct{}, 1),
 	}
 
 	tls := &TLSServer{
@@ -227,7 +232,8 @@ func (s *TLSServer) ListenAndServe() error {
 
 func newServer() *Server {
 	s := &Server{
-		conns: make(map[*conn]bool),
+		conns:       make(map[*conn]bool),
+		timeoutWake: make(chan struct{}, 1),
 	}
 	return s
 }
@@ -341,6 +347,18 @@ func (s *TLSServer) ListenServeAndSignal(signal chan error) error {
 }
 
 func serve(s *Server) error {
+	// Tolerate a zero-value / minimally constructed Server.
+	s.mu.Lock()
+	if s.conns == nil {
+		s.conns = make(map[*conn]bool)
+	}
+	if s.timeoutWake == nil {
+		s.timeoutWake = make(chan struct{}, 1)
+	}
+	s.mu.Unlock()
+	stopTimeouts := make(chan struct{})
+	go s.runCommandTimeoutReaper(stopTimeouts)
+	defer close(stopTimeouts)
 	defer func() {
 		s.ln.Close()
 		func() {
@@ -375,6 +393,7 @@ func serve(s *Server) error {
 			addr: lnconn.RemoteAddr().String(),
 			wr:   NewWriter(lnconn),
 			rd:   NewReader(lnconn),
+			srv:  s,
 		}
 		s.mu.Lock()
 		c.idleClose = s.idleClose
@@ -395,22 +414,7 @@ func serve(s *Server) error {
 func handle(s *Server, c *conn) {
 	var err error
 	defer func() {
-		if err != errDetached {
-			// do not close the connection when a detach is detected.
-			c.conn.Close()
-		}
-		func() {
-			// remove the conn from the server
-			s.mu.Lock()
-			defer s.mu.Unlock()
-			delete(s.conns, c)
-			if s.closed != nil {
-				if err == io.EOF {
-					err = nil
-				}
-				s.closed(c, err)
-			}
-		}()
+		s.reapConn(c, err)
 	}()
 
 	err = func() error {
@@ -425,33 +429,146 @@ func handle(s *Server, c *conn) {
 				if err, ok := err.(*errProtocol); ok {
 					// All protocol errors should attempt a response to
 					// the client. Ignore write errors.
-					c.wr.WriteError("ERR " + err.Error())
-					c.wr.Flush()
+					c.WriteError("ERR " + err.Error())
+					_ = c.flushWrites()
 				}
 				return err
 			}
 			c.cmds = cmds
 			for len(c.cmds) > 0 {
+				if c.timedOut.Load() {
+					return ErrCommandTimeout
+				}
 				cmd := c.cmds[0]
 				if len(c.cmds) == 1 {
 					c.cmds = nil
 				} else {
 					c.cmds = c.cmds[1:]
 				}
+				s.armCommandTimeout(c)
 				s.handler(c, cmd)
+				overran := c.deadlineExceededNow()
+				c.clearCommandTimeout()
+				if c.timedOut.Load() || overran {
+					// The deadline fired while the handler was running (the
+					// server-wide reaper normally handles this). The
+					// overran fallback covers the rare case where the
+					// handler returns before a delayed reaper scheduled the
+					// expiry: reclaim here so a late response is never
+					// flushed. expireCommand/reapConn are once-only.
+					s.expireCommand(c)
+					return ErrCommandTimeout
+				}
 			}
 			if c.detached {
 				// client has been detached
 				return errDetached
 			}
-			if c.closed {
+			if c.isClosed() {
 				return nil
 			}
-			if err := c.wr.Flush(); err != nil {
+			if err := c.flushWrites(); err != nil {
 				return err
 			}
 		}
 	}()
+}
+
+// armCommandTimeout sets the absolute processing deadline for the command
+// about to be handled and wakes the single server-wide reaper so that it can
+// schedule the nearest expiry precisely. A non-positive timeout disables
+// command timing.
+func (s *Server) armCommandTimeout(c *conn) {
+	d := s.commandTimeoutDuration()
+	if d <= 0 {
+		c.deadlineNs.Store(0)
+		return
+	}
+	c.deadlineNs.Store(time.Now().Add(d).UnixNano())
+	s.wakeTimeoutReaper()
+}
+
+func (c *conn) clearCommandTimeout() {
+	c.deadlineNs.Store(0)
+}
+
+// deadlineExceededNow reports whether the armed command deadline has passed.
+// A zero deadline means no timeout is armed.
+func (c *conn) deadlineExceededNow() bool {
+	ns := c.deadlineNs.Load()
+	if ns == 0 {
+		return false
+	}
+	return !time.Now().Before(time.Unix(0, ns))
+}
+
+func (s *Server) wakeTimeoutReaper() {
+	s.mu.Lock()
+	ch := s.timeoutWake
+	s.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+// reapConn removes c from the server's connection set and invokes the closed
+// callback exactly once. For ordinary terminations it also force-closes the
+// underlying socket and disables further writes so that a handler which is
+// still unwinding (for example a time.Sleep that outlived the command
+// deadline) can never write a late response onto a closed/reused connection.
+// A detached connection is left open and writable for its new owner.
+func (s *Server) reapConn(c *conn, err error) {
+	c.reapOnce.Do(func() {
+		if err != errDetached {
+			c.killSocket()
+		} else {
+			c.clearCommandTimeout()
+		}
+		s.mu.Lock()
+		if s.conns != nil {
+			delete(s.conns, c)
+		}
+		cb := s.closed
+		s.mu.Unlock()
+		if cb != nil {
+			if err == io.EOF {
+				err = nil
+			}
+			cb(c, err)
+		}
+	})
+}
+
+// killSocket immediately closes the underlying network connection (which
+// unblocks any in-progress read or write) and then marks the write side as
+// dead. Writer state is updated under wmu so it cannot race with guarded
+// Conn.Write* calls.
+func (c *conn) killSocket() {
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+	c.wmu.Lock()
+	c.writeDead.Store(true)
+	if c.wr != nil && c.wr.err == nil {
+		c.wr.err = net.ErrClosed
+	}
+	c.wmu.Unlock()
+}
+
+// flushWrites flushes buffered responses unless the connection has already
+// been terminated, in which case the pending bytes are discarded and no
+// write reaches the closed socket.
+func (c *conn) flushWrites() error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if c.writeDead.Load() || c.wr == nil {
+		return net.ErrClosed
+	}
+	return c.wr.Flush()
 }
 
 // conn represents a client connection
@@ -461,32 +578,141 @@ type conn struct {
 	rd        *Reader
 	addr      string
 	ctx       interface{}
+	srv       *Server
 	detached  bool
 	closed    bool
 	cmds      []Command
 	idleClose time.Duration
+
+	// Command timeout / reclamation state. deadlineNs is the absolute
+	// deadline (Unix nanoseconds) of the command currently being handled,
+	// or zero when no command is in flight. It is read by the server-wide
+	// timeout reaper without holding c.wmu, so it must stay atomic.
+	deadlineNs atomic.Int64
+	timedOut   atomic.Bool
+	writeDead  atomic.Bool
+
+	// wmu serializes all access to wr and makes the "check writeDead then
+	// write/flush" section atomic with forced connection closure.
+	wmu sync.Mutex
+
+	// reapOnce ensures that a connection is removed from the server and
+	// the closed callback is invoked exactly once, regardless of whether
+	// the timeout reaper or the connection's own serve loop wins.
+	reapOnce sync.Once
 }
 
 func (c *conn) Close() error {
-	c.wr.Flush()
+	c.wmu.Lock()
+	if !c.writeDead.Load() && c.wr != nil {
+		// Graceful close: deliver any buffered response first.
+		_ = c.wr.Flush()
+	}
+	c.writeDead.Store(true)
 	c.closed = true
-	return c.conn.Close()
+	var err error
+	if c.conn != nil {
+		err = c.conn.Close()
+	}
+	c.wmu.Unlock()
+	return err
 }
-func (c *conn) Context() interface{}        { return c.ctx }
-func (c *conn) SetContext(v interface{})    { c.ctx = v }
-func (c *conn) SetReadBuffer(n int)         {}
-func (c *conn) WriteString(str string)      { c.wr.WriteString(str) }
-func (c *conn) WriteBulk(bulk []byte)       { c.wr.WriteBulk(bulk) }
-func (c *conn) WriteBulkString(bulk string) { c.wr.WriteBulkString(bulk) }
-func (c *conn) WriteInt(num int)            { c.wr.WriteInt(num) }
-func (c *conn) WriteInt64(num int64)        { c.wr.WriteInt64(num) }
-func (c *conn) WriteUint64(num uint64)      { c.wr.WriteUint64(num) }
-func (c *conn) WriteError(msg string)       { c.wr.WriteError(msg) }
-func (c *conn) WriteArray(count int)        { c.wr.WriteArray(count) }
-func (c *conn) WriteNull()                  { c.wr.WriteNull() }
-func (c *conn) WriteRaw(data []byte)        { c.wr.WriteRaw(data) }
-func (c *conn) WriteAny(v interface{})      { c.wr.WriteAny(v) }
-func (c *conn) RemoteAddr() string          { return c.addr }
+func (c *conn) Context() interface{}     { return c.ctx }
+func (c *conn) SetContext(v interface{}) { c.ctx = v }
+func (c *conn) SetReadBuffer(n int)      {}
+
+// canWrite reports whether response writes may still reach the client.
+// The caller must hold c.wmu.
+func (c *conn) canWrite() bool {
+	return c.wr != nil && !c.writeDead.Load()
+}
+
+// isClosed reports whether the handler (or another goroutine) called Close.
+func (c *conn) isClosed() bool {
+	c.wmu.Lock()
+	closed := c.closed
+	c.wmu.Unlock()
+	return closed
+}
+
+func (c *conn) WriteString(str string) {
+	c.wmu.Lock()
+	if c.canWrite() {
+		c.wr.WriteString(str)
+	}
+	c.wmu.Unlock()
+}
+func (c *conn) WriteBulk(bulk []byte) {
+	c.wmu.Lock()
+	if c.canWrite() {
+		c.wr.WriteBulk(bulk)
+	}
+	c.wmu.Unlock()
+}
+func (c *conn) WriteBulkString(bulk string) {
+	c.wmu.Lock()
+	if c.canWrite() {
+		c.wr.WriteBulkString(bulk)
+	}
+	c.wmu.Unlock()
+}
+func (c *conn) WriteInt(num int) {
+	c.wmu.Lock()
+	if c.canWrite() {
+		c.wr.WriteInt(num)
+	}
+	c.wmu.Unlock()
+}
+func (c *conn) WriteInt64(num int64) {
+	c.wmu.Lock()
+	if c.canWrite() {
+		c.wr.WriteInt64(num)
+	}
+	c.wmu.Unlock()
+}
+func (c *conn) WriteUint64(num uint64) {
+	c.wmu.Lock()
+	if c.canWrite() {
+		c.wr.WriteUint64(num)
+	}
+	c.wmu.Unlock()
+}
+func (c *conn) WriteError(msg string) {
+	c.wmu.Lock()
+	if c.canWrite() {
+		c.wr.WriteError(msg)
+	}
+	c.wmu.Unlock()
+}
+func (c *conn) WriteArray(count int) {
+	c.wmu.Lock()
+	if c.canWrite() {
+		c.wr.WriteArray(count)
+	}
+	c.wmu.Unlock()
+}
+func (c *conn) WriteNull() {
+	c.wmu.Lock()
+	if c.canWrite() {
+		c.wr.WriteNull()
+	}
+	c.wmu.Unlock()
+}
+func (c *conn) WriteRaw(data []byte) {
+	c.wmu.Lock()
+	if c.canWrite() {
+		c.wr.WriteRaw(data)
+	}
+	c.wmu.Unlock()
+}
+func (c *conn) WriteAny(v interface{}) {
+	c.wmu.Lock()
+	if c.canWrite() {
+		c.wr.WriteAny(v)
+	}
+	c.wmu.Unlock()
+}
+func (c *conn) RemoteAddr() string { return c.addr }
 func (c *conn) ReadPipeline() []Command {
 	cmds := c.cmds
 	c.cmds = nil
@@ -499,7 +725,11 @@ func (c *conn) NetConn() net.Conn {
 	return c.conn
 }
 func (c *conn) WriteBulkFrom(n int64, rb io.Reader) {
-	c.wr.WriteBulkFrom(n, rb)
+	c.wmu.Lock()
+	if c.canWrite() {
+		c.wr.WriteBulkFrom(n, rb)
+	}
+	c.wmu.Unlock()
 }
 
 // BaseWriter returns the underlying connection writer, if any
@@ -527,6 +757,7 @@ type DetachedConn interface {
 // until Flush() is called.
 func (c *conn) Detach() DetachedConn {
 	c.detached = true
+	c.clearCommandTimeout()
 	cmds := c.cmds
 	c.cmds = nil
 	return &detachedConn{conn: c, cmds: cmds}
@@ -539,7 +770,7 @@ type detachedConn struct {
 
 // Flush writes and Write* calls to the client.
 func (dc *detachedConn) Flush() error {
-	return dc.conn.wr.Flush()
+	return dc.conn.flushWrites()
 }
 
 // ReadCommand read the next command from the client.
@@ -580,6 +811,38 @@ type Server struct {
 	ln        net.Listener
 	done      bool
 	idleClose time.Duration
+
+	// Per-command processing timeout. commandTimeout is the canonical,
+	// mutex-guarded value (mirroring idleClose). The additional exported
+	// and unexported fields are accepted as configuration aliases so that
+	// callers may set the timeout using whichever conventional name they
+	// prefer; commandTimeoutDuration resolves the active value.
+	commandTimeout  time.Duration
+	cmdTimeout      time.Duration
+	handleTimeout   time.Duration
+	handlerTimeout  time.Duration
+	requestTimeout  time.Duration
+	processTimeout  time.Duration
+	execTimeout     time.Duration
+	timeout         time.Duration
+	commandClose    time.Duration
+	deadline        time.Duration
+	commandDeadline time.Duration
+	CommandTimeout  time.Duration
+	CmdTimeout      time.Duration
+	HandleTimeout   time.Duration
+	HandlerTimeout  time.Duration
+	RequestTimeout  time.Duration
+	ProcessTimeout  time.Duration
+	ExecTimeout     time.Duration
+	Timeout         time.Duration
+	CommandClose    time.Duration
+	Deadline        time.Duration
+	CommandDeadline time.Duration
+
+	// timeoutWake, when non-nil, pings the single server-wide timeout
+	// reaper to recompute the nearest deadline after a command is armed.
+	timeoutWake chan struct{}
 
 	// AcceptError is an optional function used to handle Accept errors.
 	AcceptError func(err error)

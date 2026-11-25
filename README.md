@@ -213,6 +213,25 @@ GET: 3993610.25 requests per second
 
 *Running on a MacBook Pro 15" 2.8 GHz Intel Core i7 using Go 1.7*
 
+Command Timeout
+---------------
+
+`Server.SetIdleClose` bounds how long an idle connection stays open. To bound
+the processing time of a single command use `Server.SetCommandTimeout`:
+
+```go
+s := redcon.NewServer(addr, handler, accept, closed)
+s.SetCommandTimeout(5 * time.Second) // zero (the default) disables the limit
+go s.ListenAndServe()
+```
+
+When a handler runs longer than the limit the server closes and reclaims the
+connection (the `closed` callback receives `redcon.ErrCommandTimeout`, which
+also matches `errors.Is(err, context.DeadlineExceeded)`). Any response the
+still-unwinding handler writes afterwards is discarded instead of being
+written to the closed socket. A single server-wide timer/reaper manages all
+connections; there is no timer allocated per command.
+
 Contact
 -------
 Josh Baker [@tidwall](http://twitter.com/tidwall)
